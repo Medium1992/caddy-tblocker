@@ -1,0 +1,21 @@
+services:
+  caddy:
+    build:
+      context: ./caddy-tblocker
+    image: caddy-tblocker:local
+    ports:
+      - "80:80"
+      - "443:443"
+    # Do not publish 9080. Remna reaches it through the Compose network.
+    networks:
+      remna:
+        ipv4_address: 192.168.243.2
+
+  remnanode:
+    networks:
+      remna:
+        ipv4_address: 192.168.243.3
+
+networks:
+  remna:
+    external: true

@@ -1,0 +1,26 @@
+{
+	auto_https off
+
+	tblocker {
+		default_ttl 1m
+		max_ttl 24h
+	}
+}
+
+http://:9080 {
+	@remna_webhook path /internal/tblocker/change-this-secret
+	handle @remna_webhook {
+		tblocker_webhook {
+			allow 192.168.243.0/28
+			max_body 64KB
+		}
+	}
+	respond 404
+}
+
+http://:8080 {
+	tblocker {
+		status 403
+	}
+	respond "upstream would be here" 200
+}
