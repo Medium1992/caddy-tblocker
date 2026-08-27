@@ -28,6 +28,24 @@ docker build -t caddy-tblocker:local .
 ```
 
 The resulting image contains the standard Caddy modules plus `http.handlers.tblocker` and `http.handlers.tblocker_webhook`.
+`caddy version` reports both the upstream Caddy version and the custom build
+suffix. The exact Caddy, Go, commit, and build time are also in
+`/usr/share/caddy-tblocker/VERSION` inside the image.
+
+## Automatic upstream builds
+
+The GitHub workflow runs daily at 03:17 UTC and can be launched manually. It
+checks Caddy's latest GitHub release, updates `go.mod`, runs tests, builds with
+the current `golang:1` image, and publishes multi-architecture images to:
+
+```text
+ghcr.io/medium1992/caddy-tblocker:latest
+ghcr.io/medium1992/caddy-tblocker:vX.Y.Z
+```
+
+It updates the tracked `VERSIONS` file only after a successful image build. In
+repository Actions settings, set **Workflow permissions** to **Read and write**
+so the scheduled workflow can commit that update and publish to GHCR.
 
 ## Caddyfile
 
