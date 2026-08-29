@@ -140,3 +140,91 @@ jobs:
           git add go.mod go.sum VERSIONS
           git commit -m "chore: update Caddy to ${{ steps.upstream.outputs.caddy_version }}" || exit 0
           git push
+
+      - name: Install jq and crane
+        if: steps.decision.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y jq
+          curl -fsSL https://github.com/google/go-containerregistry/releases/download/v0.20.2/go-containerregistry_Linux_x86_64.tar.gz \
+            | sudo tar -C /usr/local/bin -xz crane
+          crane version
+
+      - name: Log in to GHCR with crane
+        if: steps.decision.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "${GH_TOKEN}" | crane auth login ghcr.io -u medium1992 --password-stdin
+
+      - name: Analyze untagged GHCR versions
+        if: steps.decision.outputs.build == 'true'
+        id: cleanup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_OWNER: medium1992
+          PACKAGE_NAME: caddy-tblocker
+          PACKAGE_NAME_ENCODED: caddy-tblocker
+        run: |
+          set -euo pipefail
+
+          packages_json='[]'
+          last_first_id=''
+          for page in $(seq 1 10); do
+            chunk=$(timeout 30s gh api -H "Accept: application/vnd.github+json" \
+              "/users/${PACKAGE_OWNER}/packages/container/${PACKAGE_NAME_ENCODED}/versions?per_page=100&page=${page}")
+            chunk_count=$(echo "$chunk" | jq length)
+            [ "$chunk_count" -eq 0 ] && break
+
+            first_id=$(echo "$chunk" | jq -r '.[0].id // ""')
+            [ -n "$last_first_id" ] && [ "$first_id" = "$last_first_id" ] && break
+            last_first_id="$first_id"
+            packages_json=$(jq -s '.[0] + .[1]' <(echo "$packages_json") <(echo "$chunk"))
+          done
+
+          declare -A protected_digests=()
+          declare -A manifest_seen=()
+
+          while IFS=$'\t' read -r id digest tags; do
+            [ -z "$id" ] && continue
+            protected_digests["$digest"]=1
+            if [ -z "${manifest_seen[$digest]+x}" ]; then
+              manifest_seen["$digest"]=1
+              manifest=$(timeout 10s crane manifest "ghcr.io/${PACKAGE_OWNER}/${PACKAGE_NAME}@${digest}" 2>/dev/null || echo '{}')
+              while IFS= read -r child_digest; do
+                [ -n "$child_digest" ] && protected_digests["$child_digest"]=1
+              done < <(echo "$manifest" | jq -r '(.manifests // [])[].digest // empty')
+            fi
+            echo "Keeping tagged manifest ${id}: ${tags}"
+          done < <(echo "$packages_json" | jq -r '
+            .[] | select((.metadata.container.tags // []) | length > 0) |
+            [.id, .name, ((.metadata.container.tags // []) | join(", "))] | @tsv')
+
+          candidates=()
+          while IFS=$'\t' read -r id digest; do
+            [ -z "$id" ] && continue
+            if [ -n "${protected_digests[$digest]+x}" ]; then
+              echo "Keeping referenced platform manifest ${id}: ${digest}"
+            else
+              candidates+=("$id")
+              echo "Deleting untagged manifest ${id}: ${digest}"
+            fi
+          done < <(echo "$packages_json" | jq -r '
+            .[] | select((.metadata.container.tags // []) | length == 0) |
+            [.id, .name] | @tsv')
+
+          if [ "${#candidates[@]}" -eq 0 ]; then
+            echo "ids=" >> "$GITHUB_OUTPUT"
+          else
+            ids=$(IFS=,; echo "${candidates[*]}")
+            echo "ids=${ids}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Delete safe untagged GHCR versions
+        if: steps.decision.outputs.build == 'true' && steps.cleanup.outputs.ids != ''
+        uses: actions/delete-package-versions@v5
+        with:
+          package-name: caddy-tblocker
+          package-type: container
+          package-version-ids: ${{ steps.cleanup.outputs.ids }}
+          token: ${{ github.token }}
