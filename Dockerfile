@@ -17,9 +17,7 @@ RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOFLAGS=-mod=readonly go build -trimpath -buildvcs=false \
     -ldflags="-s -w -X github.com/caddyserver/caddy/v2.CustomVersion=${CUSTOM_VERSION}" \
-    -o /usr/bin/caddy ./cmd/caddy \
-    && printf 'CADDY_VERSION=%s\nCUSTOM_VERSION=%s\nGO_VERSION=%s\nVCS_REF=%s\nBUILD_DATE=%s\n' \
-      "$CADDY_VERSION" "$CUSTOM_VERSION" "$(go version)" "$VCS_REF" "$BUILD_DATE" > /VERSION
+    -o /usr/bin/caddy ./cmd/caddy
 
 FROM caddy:${CADDY_DOCKER_TAG}
 ARG CADDY_VERSION
@@ -34,4 +32,3 @@ LABEL org.opencontainers.image.title="caddy-tblocker" \
       org.opencontainers.image.created="${BUILD_DATE}"
 
 COPY --from=builder /usr/bin/caddy /usr/bin/caddy
-COPY --from=builder /VERSION /usr/share/caddy-tblocker/VERSION

@@ -28,9 +28,7 @@ docker build -t caddy-tblocker:local .
 ```
 
 The resulting image contains the standard Caddy modules plus `http.handlers.tblocker` and `http.handlers.tblocker_webhook`.
-`caddy version` reports both the upstream Caddy version and the custom build
-suffix. The exact Caddy, Go, commit, and build time are also in
-`/usr/share/caddy-tblocker/VERSION` inside the image.
+`caddy version` reports both the upstream Caddy version and the custom build suffix.
 
 ## Automatic upstream builds
 
