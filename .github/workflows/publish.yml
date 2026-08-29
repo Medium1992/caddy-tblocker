@@ -10,16 +10,6 @@ on:
         required: false
         type: boolean
         default: false
-  push:
-    branches: [main]
-    paths:
-      - "Dockerfile"
-      - "cmd/**"
-      - "tblocker.go"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/publish.yml"
-
 permissions:
   contents: write
   packages: write
