@@ -1,2 +1,2 @@
 caddy=v2.11.4
-go=unverified
+go=1.27.0
