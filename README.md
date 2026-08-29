@@ -32,8 +32,9 @@ The resulting image contains the standard Caddy modules plus `http.handlers.tblo
 
 ## Automatic upstream builds
 
-The GitHub workflow runs daily at 03:17 UTC and can be launched manually. It
-checks Caddy's latest GitHub release, updates `go.mod`, runs tests, builds with
+The GitHub workflow runs daily at 03:17 UTC and can be launched manually. A
+manual launch always builds; the scheduled run builds only when Caddy or Go
+changes. It checks Caddy's latest GitHub release, updates `go.mod`, runs tests, builds with
 the latest stable Go, and publishes multi-architecture images to both registries:
 
 ```text
