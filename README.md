@@ -34,8 +34,7 @@ The resulting image contains the standard Caddy modules plus `http.handlers.tblo
 
 The GitHub workflow runs daily at 03:17 UTC and can be launched manually. It
 checks Caddy's latest GitHub release, updates `go.mod`, runs tests, builds with
-the current `golang:1` image, and publishes multi-architecture images to both
-registries:
+the latest stable Go, and publishes multi-architecture images to both registries:
 
 ```text
 ghcr.io/medium1992/caddy-tblocker:latest
@@ -44,7 +43,10 @@ medium1992/caddy-tblocker:latest
 medium1992/caddy-tblocker:vX.Y.Z
 ```
 
-It updates the tracked `VERSIONS` file only after a successful image build. In
+`VERSIONS` tracks both the upstream Caddy release and exact Go toolchain. A
+scheduled build runs when either changes. The Docker build cross-compiles the
+static Go binary natively for `amd64` and `arm64`, rather than compiling through
+QEMU. It updates the tracked `VERSIONS` file only after a successful image build. In
 repository Actions settings, set **Workflow permissions** to **Read and write**
 so the scheduled workflow can commit that update and publish to GHCR. Add the
 repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` for Docker Hub.
