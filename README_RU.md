@@ -130,13 +130,33 @@ example.com {
 
 Поле `webhookUrl` в плагине torrent-blocker ноды Remna доступно начиная с **v3.1.0**. По возможности используй актуальный релиз ноды.
 
-1. В плагине ноды **Torrent Blocker** включи плагин, задай время блокировки и укажи в поле **Webhook URL** (`webhookUrl`):
+Ниже полный блок `torrentBlocker` именно для **конфигурации плагинов ноды** Remna. Это не Caddyfile и не клиентский профиль:
 
-```text
-http://caddy:9080/internal/tblocker/replace-with-a-long-random-secret
+```json
+{
+  "torrentBlocker": {
+    "enabled": true,
+    "webhookUrl": "http://192.168.243.2:9080/internal/tblocker/replace-with-a-long-random-secret",
+    "ignoreLists": {
+      "ip": [],
+      "userId": []
+    },
+    "blockDuration": 3600
+  }
+}
 ```
 
-2. В Xray **inbound**, который принимает трафик от Caddy, добавь доверие к маркеру, отправляемому Caddy:
+| Поле | Что указывать |
+|---|---|
+| `enabled` | `true` включает обнаружение торрентов и routing rule Xray, который добавляет нода. |
+| `webhookUrl` | Внутренний URL Caddy. Если между контейнерами нет DNS по имени сервиса, используй статичный Docker IP Caddy. Секретный путь обязан полностью совпадать с `@remna_webhook path` в Caddyfile. |
+| `blockDuration` | Время блокировки в **секундах**. `3600` - один час. Для `caddy-tblocker` используй положительное значение: `0` означает вечную блокировку для nftables в ноде, но не создаёт вечный бан в памяти Caddy. |
+| `ignoreLists.ip` | IP-адреса или внешние списки (`ext:имя_списка`), которые нельзя блокировать. Если исключений нет - оставь пустой массив. |
+| `ignoreLists.userId` | ID пользователей Remna, которых нельзя блокировать. Если исключений нет - пустой массив. |
+
+Когда правило срабатывает, нода по-прежнему блокирует IP через свой nftables и дополнительно отправляет JSON-отчёт на `webhookUrl`. Caddy сохраняет этот отчёт и блокирует последующие HTTP-запросы с того же реального IP.
+
+В Xray **inbound**, который принимает трафик от Caddy, добавь доверие к маркеру, отправляемому Caddy:
 
 ```json
 {
@@ -150,7 +170,7 @@ http://caddy:9080/internal/tblocker/replace-with-a-long-random-secret
 
 Xray принимает `X-Forwarded-For` только когда присутствует один из заголовков из `trustedXForwardedFor`. В примере Caddy отправляет `X-Trusted-Proxy: caddy`, поэтому `X-Trusted-Proxy` обязан быть в этом списке. Имя маркера можно выбрать другое, но в Caddy и Xray оно должно совпадать.
 
-`header_up X-Forwarded-For ...` и `trustedXForwardedFor` настраиваются отдельно от плагина Remna: именно они делают IP в отчёте Xray тем же реальным IP за CDN, который затем проверит Caddy. Подставь вместо `caddy` имя сервиса из Compose. Если используются закреплённые IP вместо Docker DNS, укажи внутренний статичный IP Caddy.
+`header_up X-Forwarded-For ...` и `trustedXForwardedFor` настраиваются отдельно от плагина Remna: именно они делают IP в отчёте Xray тем же реальным IP за CDN, который затем проверит Caddy.
 
 ## 🔐 Реальный IP клиента
 
