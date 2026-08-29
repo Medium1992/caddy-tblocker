@@ -13,8 +13,8 @@
 ## ✨ Возможности
 
 - 🧱 **Нативный модуль Caddy**: без базы данных, Redis, sidecar-контейнера и внешнего API на пути запроса.
-- ⏱️ **Временные блокировки IP**: принимает `willUnblockAt` или `blockDuration` из Remna и лениво удаляет истёкшие записи.
-- 🌐 **Корректный IP клиента**: использует `{client_ip}` от Caddy с учётом trusted proxies, а не сырой заголовок из запроса.
+- ⏱️ **Временные блокировки IP**: принимает `willUnblockAt` или `blockDuration` из Remna; истёкшая запись удаляется, когда этот IP в следующий раз делает запрос.
+- 🌐 **Один IP по всей цепочке**: Caddy определяет реальный IP за CDN, передаёт его в Xray и сверяет с тем же IP, который приходит от Remna.
 - 🔒 **Внутренний webhook**: отправителя можно ограничить Docker-подсетью, а порт `9080` не публиковать наружу.
 - ⚡ **Ранний отказ**: проверка выполняется до reverse proxy в Xray.
 - 🐳 **Готовые образы**: multi-arch `amd64` и `arm64` в Docker Hub и GHCR.
@@ -56,10 +56,11 @@ ghcr.io/medium1992/caddy-tblocker:vX.Y.Z
 
 ## ⚙️ Как это работает
 
-1. Remna делает POST с отчётом torrent-blocker на внутренний `tblocker_webhook`.
-2. Webhook сохраняет IP и время истечения в памяти Caddy.
-3. `tblocker` сравнивает `{client_ip}` от Caddy с этим списком.
-4. При совпадении Caddy возвращает `403`, не передавая запрос в Xray или другой upstream.
+1. CDN передаёт запрос в Caddy и указывает реальный IP клиента в `X-Real-IP`.
+2. Caddy определяет из него `{client_ip}` и передаёт тот же IP в Xray через `X-Forwarded-For`.
+3. Когда срабатывает torrent-blocker, Xray отправляет этот IP в ноду Remna.
+4. Нода делает POST с IP и временем истечения на внутренний `tblocker_webhook` Caddy.
+5. `tblocker` сравнивает определённый Caddy `{client_ip}` с IP из webhook. Следующие совпадающие запросы получают `403` ещё до Xray.
 
 Текущий payload от Remna принимается без преобразований:
 
@@ -116,22 +117,44 @@ example.com {
       status 403
     }
 
-    reverse_proxy 192.168.243.3:10000
+    reverse_proxy 192.168.243.3:10000 {
+      # Передаём в Xray реальный IP, полученный от CDN.
+      header_up X-Trusted-Proxy "caddy"
+      header_up X-Forwarded-For {http.request.header.X-Real-Ip}
+    }
   }
 }
 ```
 
-В Remna укажи точный URL webhook:
+## 🔌 Нода Remna и Xray
+
+Поле `webhookUrl` в плагине torrent-blocker ноды Remna доступно начиная с **v3.1.0**. По возможности используй актуальный релиз ноды.
+
+1. В плагине ноды **Torrent Blocker** включи плагин, задай время блокировки и укажи в поле **Webhook URL** (`webhookUrl`):
 
 ```text
 http://caddy:9080/internal/tblocker/replace-with-a-long-random-secret
 ```
 
-Подставь вместо `caddy` имя сервиса из Compose. Если между контейнерами используются закреплённые IP вместо Docker DNS, укажи внутренний статичный IP Caddy.
+2. В Xray **inbound**, который принимает трафик от Caddy, добавь доверие к маркеру, отправляемому Caddy:
+
+```json
+{
+  "streamSettings": {
+    "sockopt": {
+      "trustedXForwardedFor": ["X-Trusted-Proxy"]
+    }
+  }
+}
+```
+
+Xray принимает `X-Forwarded-For` только когда присутствует один из заголовков из `trustedXForwardedFor`. В примере Caddy отправляет `X-Trusted-Proxy: caddy`, поэтому `X-Trusted-Proxy` обязан быть в этом списке. Имя маркера можно выбрать другое, но в Caddy и Xray оно должно совпадать.
+
+`header_up X-Forwarded-For ...` и `trustedXForwardedFor` настраиваются отдельно от плагина Remna: именно они делают IP в отчёте Xray тем же реальным IP за CDN, который затем проверит Caddy. Подставь вместо `caddy` имя сервиса из Compose. Если используются закреплённые IP вместо Docker DNS, укажи внутренний статичный IP Caddy.
 
 ## 🔐 Реальный IP клиента
 
-Модуль **не доверяет** `X-Real-IP` и `X-Forwarded-For` сам по себе. Он получает уже вычисленный Caddy адрес клиента. Поэтому на listener, принимающем трафик от CDN, обязательно нужны `trusted_proxies` и `client_ip_headers`.
+`{client_ip}` - это вычисленный Caddy адрес клиента. Это не HTTP-заголовок и не TCP-адрес, который видит Xray. Caddy получает его из заголовка CDN только когда TCP-пир входит в `trusted_proxies`; именно это значение `tblocker` сравнивает с IP из webhook.
 
 - Замени пример CIDR на опубликованные диапазоны ingress-узлов своего CDN.
 - Ограничь origin фаерволом: к публичному listener должны приходить только IP CDN.
