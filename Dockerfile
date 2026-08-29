@@ -1,21 +1,26 @@
+## syntax=docker/dockerfile:1
+
 ARG CADDY_DOCKER_TAG=2
+ARG GO_VERSION=1
 ARG CADDY_VERSION=unknown
 ARG CUSTOM_VERSION=unknown
 ARG VCS_REF=unknown
 ARG BUILD_DATE=unknown
 
-FROM golang:1 AS builder
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION} AS builder
 
 ARG CADDY_VERSION
 ARG CUSTOM_VERSION
 ARG VCS_REF
 ARG BUILD_DATE
+ARG TARGETOS
+ARG TARGETARCH
 
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOFLAGS=-mod=readonly go build -trimpath -buildvcs=false \
+RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH GOFLAGS=-mod=readonly go build -trimpath -buildvcs=false \
     -ldflags="-s -w -X github.com/caddyserver/caddy/v2.CustomVersion=${CUSTOM_VERSION}" \
     -o /usr/bin/caddy ./cmd/caddy
 

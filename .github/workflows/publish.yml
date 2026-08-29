@@ -40,27 +40,36 @@ jobs:
           echo "caddy_version=$caddy_version" >> "$GITHUB_OUTPUT"
           echo "docker_tag=${caddy_version#v}" >> "$GITHUB_OUTPUT"
 
+      - name: Set up latest stable Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: stable
+
+      - name: Read the Go toolchain version
+        id: toolchain
+        run: |
+          set -euo pipefail
+          go_version=$(go version | awk '{print $3}' | sed 's/^go//')
+          test -n "$go_version"
+          echo "go_version=$go_version" >> "$GITHUB_OUTPUT"
+
       - name: Decide whether a scheduled build is needed
         id: decision
         env:
           LATEST: ${{ steps.upstream.outputs.caddy_version }}
+          GO_VERSION: ${{ steps.toolchain.outputs.go_version }}
           FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
-          current=$(sed -n 's/^caddy=//p' VERSIONS)
+          current_caddy=$(sed -n 's/^caddy=//p' VERSIONS)
+          current_go=$(sed -n 's/^go=//p' VERSIONS)
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "$FORCE" = "true" ]; then
             echo "build=true" >> "$GITHUB_OUTPUT"
-          elif [ "$LATEST" != "$current" ]; then
+          elif [ "$LATEST" != "$current_caddy" ] || [ "$GO_VERSION" != "$current_go" ]; then
             echo "build=true" >> "$GITHUB_OUTPUT"
           else
             echo "build=false" >> "$GITHUB_OUTPUT"
           fi
-
-      - name: Set up latest stable Go
-        if: steps.decision.outputs.build == 'true'
-        uses: actions/setup-go@v6
-        with:
-          go-version: stable
 
       - name: Update and test the Caddy dependency
         if: steps.decision.outputs.build == 'true'
@@ -72,7 +81,7 @@ jobs:
           go mod tidy
           go test ./...
           go vet ./...
-          printf 'caddy=%s\n' "$CADDY_VERSION" > VERSIONS
+          printf 'caddy=%s\ngo=%s\n' "$CADDY_VERSION" "${{ steps.toolchain.outputs.go_version }}" > VERSIONS
 
       - name: Set build metadata
         if: steps.decision.outputs.build == 'true'
@@ -116,6 +125,7 @@ jobs:
           push: true
           build-args: |
             CADDY_DOCKER_TAG=${{ steps.upstream.outputs.docker_tag }}
+            GO_VERSION=${{ steps.toolchain.outputs.go_version }}
             CADDY_VERSION=${{ steps.upstream.outputs.caddy_version }}
             CUSTOM_VERSION=${{ steps.metadata.outputs.custom_version }}
             VCS_REF=${{ steps.metadata.outputs.revision }}
@@ -125,6 +135,8 @@ jobs:
             ${{ env.GHCR_IMAGE }}:${{ steps.upstream.outputs.caddy_version }}
             ${{ env.DOCKERHUB_IMAGE }}:latest
             ${{ env.DOCKERHUB_IMAGE }}:${{ steps.upstream.outputs.caddy_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Commit updated upstream version
         if: steps.decision.outputs.build == 'true'
