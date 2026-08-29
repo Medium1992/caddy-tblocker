@@ -46,7 +46,8 @@ medium1992/caddy-tblocker:vX.Y.Z
 `VERSIONS` tracks both the upstream Caddy release and exact Go toolchain. A
 scheduled build runs when either changes. The Docker build cross-compiles the
 static Go binary natively for `amd64` and `arm64`, rather than compiling through
-QEMU. It updates the tracked `VERSIONS` file only after a successful image build. In
+QEMU. The initial `go=unverified` value forces one rebuild so the first exact
+toolchain is recorded. It updates the tracked `VERSIONS` file only after a successful image build. In
 repository Actions settings, set **Workflow permissions** to **Read and write**
 so the scheduled workflow can commit that update and publish to GHCR. Add the
 repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` for Docker Hub.
