@@ -4,12 +4,6 @@ on:
   schedule:
     - cron: "17 3 * * *"
   workflow_dispatch:
-    inputs:
-      force:
-        description: Build even when Caddy has not changed
-        required: false
-        type: boolean
-        default: false
 permissions:
   contents: write
   packages: write
@@ -58,12 +52,11 @@ jobs:
         env:
           LATEST: ${{ steps.upstream.outputs.caddy_version }}
           GO_VERSION: ${{ steps.toolchain.outputs.go_version }}
-          FORCE: ${{ inputs.force }}
         run: |
           set -euo pipefail
           current_caddy=$(sed -n 's/^caddy=//p' VERSIONS)
           current_go=$(sed -n 's/^go=//p' VERSIONS)
-          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ] && [ "$FORCE" = "true" ]; then
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
             echo "build=true" >> "$GITHUB_OUTPUT"
           elif [ "$LATEST" != "$current_caddy" ] || [ "$GO_VERSION" != "$current_go" ]; then
             echo "build=true" >> "$GITHUB_OUTPUT"
