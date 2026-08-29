@@ -130,13 +130,33 @@ example.com {
 
 The additional `webhookUrl` field in the Remna torrent-blocker plugin is available starting with **node v3.1.0**. Use the current node release when possible.
 
-1. In the node's **Torrent Blocker** plugin, enable the plugin, choose its block duration, and set **Webhook URL** (`webhookUrl`) to:
+This is the complete `torrentBlocker` block for the **node plugin configuration**. It belongs in Remna's node plugins, not in the Caddyfile and not in a client profile:
 
-```text
-http://caddy:9080/internal/tblocker/replace-with-a-long-random-secret
+```json
+{
+  "torrentBlocker": {
+    "enabled": true,
+    "webhookUrl": "http://192.168.243.2:9080/internal/tblocker/replace-with-a-long-random-secret",
+    "ignoreLists": {
+      "ip": [],
+      "userId": []
+    },
+    "blockDuration": 3600
+  }
+}
 ```
 
-2. In the Xray **inbound** that accepts traffic from Caddy, configure the marker Caddy sends above:
+| Field | What to set |
+|---|---|
+| `enabled` | `true` enables torrent detection and the node's Xray routing rule. |
+| `webhookUrl` | The internal Caddy URL. Use Caddy's static Docker IP when service-name DNS is unavailable. The random path must exactly match the `@remna_webhook path` in the Caddyfile. |
+| `blockDuration` | Block duration in **seconds**. `3600` is one hour. Use a positive value with `caddy-tblocker`; `0` means permanent blocking to the node's nftables service, but cannot create a permanent in-memory Caddy ban. |
+| `ignoreLists.ip` | IP addresses or external lists (`ext:list_name`) that must never be blocked. Leave empty for none. |
+| `ignoreLists.userId` | Remna user IDs that must never be blocked. Leave empty for none. |
+
+When the rule triggers, the node still applies its own nftables block and also sends the JSON report to `webhookUrl`. Caddy stores that report and blocks later HTTP requests from the same real IP.
+
+In the Xray **inbound** that accepts traffic from Caddy, configure the marker Caddy sends above:
 
 ```json
 {
@@ -150,7 +170,7 @@ http://caddy:9080/internal/tblocker/replace-with-a-long-random-secret
 
 Xray accepts `X-Forwarded-For` only when one of the header names in `trustedXForwardedFor` is present. In this example, Caddy sends `X-Trusted-Proxy: caddy`, so `X-Trusted-Proxy` must appear in that list. The marker name is arbitrary, but the Caddy and Xray values must match.
 
-`header_up X-Forwarded-For ...` and `trustedXForwardedFor` are separate from the Remna plugin: they make the source IP reported by Xray equal to the CDN real IP that Caddy will later check. Use your Compose service name instead of `caddy`; for fixed-address Docker networks, use Caddy's fixed internal IP.
+`header_up X-Forwarded-For ...` and `trustedXForwardedFor` are separate from the Remna plugin: they make the source IP reported by Xray equal to the CDN real IP that Caddy will later check.
 
 ## 🔐 Real Client IP
 
