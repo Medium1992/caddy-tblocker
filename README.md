@@ -1,13 +1,67 @@
 # caddy-tblocker
 
-`caddy-tblocker` is a custom Caddy module for the Remna torrent-blocker webhook.
-It keeps temporary bans in Caddy memory and rejects requests by Caddy's trusted-proxy-aware `client_ip` before they reach Xray.
+> Custom [Caddy](https://caddyserver.com/) image with a native, in-memory TTL blocklist for the [Remna](https://github.com/remnawave) torrent-blocker webhook. It blocks a reported client IP at the HTTP edge before the request reaches Xray.
 
-It has no database and no additional service. A Caddy reload clears active bans; this is deliberate for short TTLs.
+[English](README.md) | [Русский](README_RU.md) | [Telegram](https://t.me/+96HVPF3Ww6o3YTNi)
 
-## What it accepts
+[![Docker Pulls](https://img.shields.io/docker/pulls/medium1992/caddy-tblocker?logo=docker&label=docker%20pulls)](https://hub.docker.com/r/medium1992/caddy-tblocker)
+[![Docker Image Size](https://img.shields.io/docker/image-size/medium1992/caddy-tblocker/latest?logo=docker&label=image%20size)](https://hub.docker.com/r/medium1992/caddy-tblocker)
+[![Caddy](https://img.shields.io/github/v/release/caddyserver/caddy?label=Caddy&logo=caddy)](https://github.com/caddyserver/caddy/releases)
+![Platforms](https://img.shields.io/badge/arch-amd64%20%7C%20arm64-blue)
+[![Telegram](https://img.shields.io/badge/Telegram-group-blue?logo=telegram)](https://t.me/+96HVPF3Ww6o3YTNi)
 
-The module accepts the JSON already sent by current Remna nodes:
+## ✨ Features
+
+- 🧱 **Native Caddy module**: no database, Redis, sidecar, or external API on the request path.
+- ⏱️ **Temporary IP bans**: accepts Remna's `willUnblockAt` or `blockDuration` and removes expired entries lazily.
+- 🌐 **Correct client address**: checks Caddy's trusted-proxy-aware `{client_ip}`, not an untrusted request header.
+- 🔒 **Internal webhook listener**: restrict the sender by Docker subnet and keep port `9080` unpublished.
+- ⚡ **Early rejection**: bans are evaluated before the Xray reverse proxy.
+- 🐳 **Ready-made images**: multi-architecture `amd64` and `arm64` images for Docker Hub and GHCR.
+- 🔄 **Upstream tracking**: scheduled workflow rebuilds when Caddy or the Go toolchain changes.
+
+> [!IMPORTANT]
+> Bans live only in Caddy memory. A Caddy restart or reload clears them intentionally. This keeps a bad webhook or configuration from producing a persistent lockout.
+
+## 🚀 Quick Start
+
+```bash
+docker pull medium1992/caddy-tblocker:latest
+```
+
+Use the image instead of stock `caddy` in Compose:
+
+```yaml
+services:
+  caddy:
+    image: medium1992/caddy-tblocker:latest
+    restart: unless-stopped
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    # Do not publish 9080. Remna reaches it only inside this network.
+    ports:
+      - "443:443"
+```
+
+Images:
+
+```text
+medium1992/caddy-tblocker:latest
+medium1992/caddy-tblocker:vX.Y.Z
+ghcr.io/medium1992/caddy-tblocker:latest
+ghcr.io/medium1992/caddy-tblocker:vX.Y.Z
+```
+
+## ⚙️ How It Works
+
+1. Remna POSTs a torrent-blocker report to the internal `tblocker_webhook` endpoint.
+2. The webhook stores the IP and expiration timestamp in Caddy memory.
+3. `tblocker` compares Caddy's `{client_ip}` with that store.
+4. A matching request is answered with `403` before it reaches Xray or another upstream.
+
+The current Remna payload is accepted as-is:
 
 ```json
 {
@@ -19,43 +73,14 @@ The module accepts the JSON already sent by current Remna nodes:
 }
 ```
 
-`willUnblockAt` is preferred. If it is absent, `blockDuration` is treated as seconds. `max_ttl` caps either value.
+`willUnblockAt` has priority. If it is absent, `blockDuration` is interpreted as seconds. `default_ttl` is used only when neither field is available; `max_ttl` caps any supplied expiration.
 
-## Build
+> [!NOTE]
+> Current Remna nodes emit torrent reports only when their nftables service is available. Keep the node's required nft capability: Caddy becomes the client-facing ban layer after the webhook is emitted.
 
-```bash
-docker build -t caddy-tblocker:local .
-```
+## 🧩 Caddyfile
 
-The resulting image contains the standard Caddy modules plus `http.handlers.tblocker` and `http.handlers.tblocker_webhook`.
-`caddy version` reports both the upstream Caddy version and the custom build suffix.
-
-## Automatic upstream builds
-
-The GitHub workflow runs daily at 03:17 UTC and can be launched manually. A
-manual launch always builds; the scheduled run builds only when Caddy or Go
-changes. It checks Caddy's latest GitHub release, updates `go.mod`, runs tests, builds with
-the latest stable Go, and publishes multi-architecture images to both registries:
-
-```text
-ghcr.io/medium1992/caddy-tblocker:latest
-ghcr.io/medium1992/caddy-tblocker:vX.Y.Z
-medium1992/caddy-tblocker:latest
-medium1992/caddy-tblocker:vX.Y.Z
-```
-
-`VERSIONS` tracks both the upstream Caddy release and exact Go toolchain. A
-scheduled build runs when either changes. The Docker build cross-compiles the
-static Go binary natively for `amd64` and `arm64`, rather than compiling through
-QEMU. The initial `go=unverified` value forces one rebuild so the first exact
-toolchain is recorded. It updates the tracked `VERSIONS` file only after a successful image build. In
-repository Actions settings, set **Workflow permissions** to **Read and write**
-so the scheduled workflow can commit that update and publish to GHCR. Add the
-repository secrets `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` for Docker Hub.
-
-## Caddyfile
-
-The webhook listener must stay inside the Docker network. Do not publish port `9080` to the Internet. The unguessable path is the authentication boundary available to the current Remna webhook client; `allow` additionally restricts callers to the Docker subnet.
+`route` is intentional: it preserves the declared directive order, ensuring the ban check always runs before terminal handlers such as `reverse_proxy`.
 
 ```caddy
 {
@@ -63,9 +88,15 @@ The webhook listener must stay inside the Docker network. Do not publish port `9
     default_ttl 1m
     max_ttl 24h
   }
+
+  # Trust only real CDN ingress ranges here.
+  servers :443 {
+    trusted_proxies static 198.51.100.0/24 2001:db8:1234::/48
+    client_ip_headers X-Real-IP
+  }
 }
 
-# Internal-only listener. Do not publish 9080 in Docker.
+# Docker-network only. Do not publish port 9080 to the Internet.
 http://:9080 {
   @remna_webhook path /internal/tblocker/replace-with-a-long-random-secret
   handle @remna_webhook {
@@ -74,54 +105,44 @@ http://:9080 {
       max_body 64KB
     }
   }
+
   respond 404
 }
 
 example.com {
-  # This must run before reverse_proxy/Xray.
-  tblocker {
-    status 403
-  }
+  route {
+    # Must be first: checks the trusted client IP before Xray.
+    tblocker {
+      status 403
+    }
 
-  reverse_proxy 127.0.0.1:10000
+    reverse_proxy 192.168.243.3:10000
+  }
 }
 ```
 
-Set the Remna `torrentBlocker.webhookUrl` to:
+Set Remna's torrent-blocker webhook URL to:
 
 ```text
 http://caddy:9080/internal/tblocker/replace-with-a-long-random-secret
 ```
 
-Use the actual Compose service name instead of `caddy` if it differs.
+Use your Compose service name instead of `caddy`. If containers communicate through fixed addresses rather than Docker DNS, use Caddy's fixed internal IP instead.
 
-Current Remna releases only activate torrent detection when their nftables
-service is available. With the stock node, keep its required nft capability so
-it emits the webhook; the Caddy block remains the effective client-facing ban.
-For a strictly Caddy-only deployment, the node needs a small follow-up change
-to configure Xray's torrent webhook even when nftables is unavailable.
+## 🔐 Real Client IP
 
-## Real client IP is mandatory
+The module does **not** trust raw `X-Real-IP` or `X-Forwarded-For` by itself. It receives Caddy's resolved client address, so `trusted_proxies` and `client_ip_headers` must be configured on the listener receiving CDN traffic.
 
-`tblocker` never trusts raw `X-Real-IP` or `X-Forwarded-For` itself. It checks Caddy's `{client_ip}`, so configure Caddy's `trusted_proxies` and `client_ip_headers` with the CDN's genuine ingress ranges. Without that, Caddy sees the CDN edge address and the ban cannot match the reported subscriber address.
+- Replace the example CIDRs with the CDN's documented ingress ranges.
+- Firewall the origin so only that CDN can reach the public listener.
+- Never configure a public listener with `trusted_proxies static 0.0.0.0/0`; a direct caller could forge the header.
+- A separate CDN-only port protected by firewall may have its own trusted-proxy policy.
 
-Example shape only; replace the CIDRs with the ranges of your CDN:
+Without this, Caddy sees the CDN edge IP and a Remna report for the subscriber IP cannot match.
 
-```caddy
-{
-  servers {
-    trusted_proxies static 203.0.113.0/24 2001:db8:1234::/48
-    trusted_proxies_strict
-    client_ip_headers X-Real-IP
-  }
-}
-```
+## 🛠️ Directives
 
-The origin must also be firewall-restricted to the CDN so a direct caller cannot supply a forged `X-Real-IP`.
-
-## Caddyfile directives
-
-Global app:
+### Global app
 
 ```caddy
 tblocker {
@@ -130,7 +151,12 @@ tblocker {
 }
 ```
 
-Request handler:
+| Option | Default | Description |
+|---|---:|---|
+| `default_ttl` | `1m` | Fallback expiry when the webhook supplies neither valid expiry field. |
+| `max_ttl` | `24h` | Maximum accepted lifetime for a ban. |
+
+### Request handler
 
 ```caddy
 tblocker {
@@ -138,7 +164,11 @@ tblocker {
 }
 ```
 
-Webhook handler:
+| Option | Default | Description |
+|---|---:|---|
+| `status` | `403` | HTTP response for a blocked client. Must be a 4xx status. |
+
+### Webhook handler
 
 ```caddy
 tblocker_webhook {
@@ -147,4 +177,35 @@ tblocker_webhook {
 }
 ```
 
-`allow` is required. The default webhook body limit is 64 KiB.
+| Option | Default | Description |
+|---|---:|---|
+| `allow` | required | CIDRs permitted to call the webhook. |
+| `max_body` | `64KB` | Maximum accepted webhook request body. |
+
+Successful webhook requests return `204 No Content`. Malformed payloads return `400`; callers outside `allow` receive `403`.
+
+## 🏗️ Local Build
+
+```bash
+docker build -t caddy-tblocker:local .
+docker run --rm caddy-tblocker:local caddy version
+```
+
+The image retains standard Caddy modules and adds:
+
+```text
+http.handlers.tblocker
+http.handlers.tblocker_webhook
+```
+
+## 🔄 Automatic Builds
+
+The GitHub Actions workflow can be run manually and checks upstream once a day. A manual run always builds; the scheduled run publishes only when Caddy or the Go toolchain changes. Images are built natively for `amd64` and `arm64`, then published to Docker Hub and GHCR.
+
+For Docker Hub publishing, add `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` as repository secrets. Set GitHub Actions **Workflow permissions** to **Read and write** so scheduled builds can update the tracked upstream version file.
+
+## ⭐ Support
+
+If the project was useful, give it a [star](https://github.com/Medium1992/caddy-tblocker/stargazers) and join the [Telegram group](https://t.me/+96HVPF3Ww6o3YTNi).
+
+[English](README.md) | [Русский](README_RU.md) | [Telegram](https://t.me/+96HVPF3Ww6o3YTNi)
