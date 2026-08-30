@@ -347,6 +347,8 @@ tblocker {
 tblocker {
 	status 403
 	drop_existing
+	header <name> <value>
+	header -<name>
 }
 ```
 
@@ -354,8 +356,20 @@ tblocker {
 |---|---:|---|
 | `status` | `403` | Response for a blocked client. Must be `400`–`599`; anything else is rejected when the config is loaded. |
 | `drop_existing` | off | Cancel the requests already in flight for an address when it gets banned. Without it an established tunnel keeps running until the client reconnects. Accepts a bare flag, or `on` / `off`. |
+| `header` | none | Set a header on the block response. Repeat the option for more headers, repeat a name for multiple values, and use `-<name>` to remove one — including the default `Cache-Control: no-store`. |
 
 A request whose `{client_ip}` is empty or unparsable is passed through rather than blocked.
+
+**Matching a disguised site.** By default a ban answers with a bare `403`, which is a distinguishable response: the client learns it was banned, and on a site that pretends to be something else that breaks the cover story. `handle_response` inside `reverse_proxy` does not help, because it only rewrites responses that came from the upstream, and a ban never reaches the proxy. `status` together with `header` makes the block response identical to whatever the site normally returns:
+
+```caddy
+tblocker {
+	status 401
+	drop_existing
+	header WWW-Authenticate `Basic realm="restricted"`
+	header -Cache-Control
+}
+```
 
 ### Webhook handler
 
