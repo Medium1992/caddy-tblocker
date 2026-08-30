@@ -590,3 +590,73 @@ func TestDropExistingLeavesOtherClientsAlone(t *testing.T) {
 		t.Fatalf("the bystander was cancelled: %v", err)
 	}
 }
+
+// The block response has to be able to match whatever the site normally
+// returns, otherwise a banned client can tell a ban apart from ordinary
+// behaviour just by reading the status line.
+func TestBlockResponseHeaders(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	app := newTestApp(now)
+	addr := netip.MustParseAddr("203.0.113.42")
+	app.Ban(addr, now.Add(time.Minute))
+
+	handler := Handler{
+		StatusCode: http.StatusUnauthorized,
+		Headers: map[string][]string{
+			"Www-Authenticate": {`Basic realm="restricted"`},
+			"Cache-Control":    {}, // remove the default
+			"Set-Cookie":       {"a=1", "b=2"},
+		},
+		app: app,
+	}
+
+	recorder, passed := serve(t, handler, requestWithClientIP(addr.String()))
+	if passed || recorder.Code != http.StatusUnauthorized {
+		t.Fatalf("passed=%v status=%d", passed, recorder.Code)
+	}
+	if got := recorder.Header().Get("WWW-Authenticate"); got != `Basic realm="restricted"` {
+		t.Fatalf("WWW-Authenticate=%q", got)
+	}
+	if got, ok := recorder.Header()["Cache-Control"]; ok {
+		t.Fatalf("an empty value list must remove the header, got %q", got)
+	}
+	if got := recorder.Header().Values("Set-Cookie"); len(got) != 2 {
+		t.Fatalf("repeated header lost: %q", got)
+	}
+}
+
+func TestBlockResponseKeepsNoStoreByDefault(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	app := newTestApp(now)
+	addr := netip.MustParseAddr("203.0.113.42")
+	app.Ban(addr, now.Add(time.Minute))
+	handler := Handler{StatusCode: http.StatusForbidden, app: app}
+
+	recorder, _ := serve(t, handler, requestWithClientIP(addr.String()))
+	if got := recorder.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control=%q want=no-store", got)
+	}
+}
+
+// A JSON config carries header names exactly as written, so a lower-case name
+// must still land on the response.
+func TestBlockResponseHeaderNamesAreCaseInsensitive(t *testing.T) {
+	now := time.Date(2026, 8, 28, 12, 0, 0, 0, time.UTC)
+	app := newTestApp(now)
+	addr := netip.MustParseAddr("203.0.113.42")
+	app.Ban(addr, now.Add(time.Minute))
+
+	handler := Handler{
+		StatusCode: http.StatusUnauthorized,
+		Headers:    map[string][]string{"www-authenticate": {"Basic"}, "cache-control": {}},
+		app:        app,
+	}
+
+	recorder, _ := serve(t, handler, requestWithClientIP(addr.String()))
+	if got := recorder.Header().Get("WWW-Authenticate"); got != "Basic" {
+		t.Fatalf("WWW-Authenticate=%q", got)
+	}
+	if _, ok := recorder.Header()["Cache-Control"]; ok {
+		t.Fatal("a lower-case name must still remove the default header")
+	}
+}

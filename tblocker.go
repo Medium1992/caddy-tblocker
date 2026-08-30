@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -432,6 +433,11 @@ type Handler struct {
 	// DropExisting tears down the requests already in flight for an address
 	// when it gets banned, instead of only refusing its next one.
 	DropExisting bool `json:"drop_existing,omitempty"`
+	// Headers are written on the block response, so it can be made
+	// indistinguishable from whatever the site normally returns. An empty
+	// value list removes that header instead, including the default
+	// Cache-Control.
+	Headers map[string][]string `json:"headers,omitempty"`
 
 	app *App
 }
@@ -451,6 +457,16 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	}
 	if err := validateStatus(h.StatusCode); err != nil {
 		return fmt.Errorf("tblocker: %w", err)
+	}
+	if len(h.Headers) > 0 {
+		canonical := make(map[string][]string, len(h.Headers))
+		for name, values := range h.Headers {
+			if name == "" {
+				return fmt.Errorf("tblocker: header name must not be empty")
+			}
+			canonical[http.CanonicalHeaderKey(name)] = values
+		}
+		h.Headers = canonical
 	}
 	app, err := lookupApp(ctx, "tblocker")
 	if err != nil {
@@ -484,6 +500,12 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 		h.app.logger.Debug("request denied", zap.String("client_ip", addr.String()))
 	}
 	w.Header().Set("Cache-Control", "no-store")
+	for name, values := range h.Headers {
+		w.Header().Del(name)
+		for _, value := range values {
+			w.Header().Add(name, value)
+		}
+	}
 	w.WriteHeader(h.StatusCode)
 	return nil
 }
@@ -825,6 +847,27 @@ func parseHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 				return nil, h.Err(err.Error())
 			}
 			handler.StatusCode = status
+		case "header":
+			values := h.RemainingArgs()
+			switch len(values) {
+			case 1:
+				name := strings.TrimPrefix(values[0], "-")
+				if name == values[0] || name == "" {
+					return nil, h.Errf(`header takes "<name> <value>", or "-<name>" to remove one`)
+				}
+				if handler.Headers == nil {
+					handler.Headers = make(map[string][]string)
+				}
+				handler.Headers[http.CanonicalHeaderKey(name)] = []string{}
+			case 2:
+				if handler.Headers == nil {
+					handler.Headers = make(map[string][]string)
+				}
+				name := http.CanonicalHeaderKey(values[0])
+				handler.Headers[name] = append(handler.Headers[name], values[1])
+			default:
+				return nil, h.Errf(`header takes "<name> <value>", or "-<name>" to remove one`)
+			}
 		case "drop_existing":
 			values := h.RemainingArgs()
 			switch {
