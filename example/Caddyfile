@@ -4,23 +4,55 @@
 	tblocker {
 		default_ttl 1m
 		max_ttl 24h
+
+		# Never ban infrastructure. With host networking Xray's fallback
+		# address is loopback, so protecting it keeps a malformed report from
+		# taking the origin down.
+		ignore 127.0.0.0/8
 	}
 }
 
-http://:9080 {
-	@remna_webhook path /internal/tblocker/change-this-secret
-	handle @remna_webhook {
+# The node posts reports here. `bind` is what actually restricts the socket to
+# loopback: a site address of `http://127.0.0.1:9080` alone only adds a Host
+# matcher, and Caddy would still listen on every interface.
+http://127.0.0.1:9080 {
+	bind 127.0.0.1
+
+	@node_webhook path /internal/tblocker/change-this-secret
+	handle @node_webhook {
 		tblocker_webhook {
-			allow 192.168.243.0/28
-			max_body 64KB
+			allow 127.0.0.0/8
+			max_body 64KiB
 		}
 	}
+
+	# Inspect and release bans by hand. The panel's own unblock command talks
+	# to the node's nftables service and never reaches Caddy.
+	#
+	#   curl           http://127.0.0.1:9080/internal/tblocker/admin
+	#   curl -X DELETE 'http://127.0.0.1:9080/internal/tblocker/admin?ip=203.0.113.42'
+	@tblocker_admin path /internal/tblocker/admin
+	handle @tblocker_admin {
+		tblocker_admin {
+			allow 127.0.0.0/8
+		}
+	}
+
 	respond 404
+
+	# The secret path would otherwise be written to the access log verbatim.
+	log {
+		output discard
+	}
 }
 
 http://:8080 {
+	# No `route` wrapper needed: the directive is ordered ahead of every
+	# handler that can terminate the chain, including `handle` and `respond`.
 	tblocker {
 		status 403
+		drop_existing
 	}
+
 	respond "upstream would be here" 200
 }

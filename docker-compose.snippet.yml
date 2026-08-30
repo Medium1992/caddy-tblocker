@@ -1,21 +1,32 @@
+# Node server, host networking: the layout Remnawave's own docs use for the
+# node (https://docs.rw/install/remnawave-node/). Caddy joins the same network
+# namespace, so the internal listener lives on loopback and there is no port to
+# forget to close.
 services:
-  caddy:
-    build:
-      context: ./caddy-tblocker
-    image: caddy-tblocker:local
-    ports:
-      - "80:80"
-      - "443:443"
-    # Do not publish 9080. Remna reaches it through the Compose network.
-    networks:
-      remna:
-        ipv4_address: 192.168.243.2
-
   remnanode:
-    networks:
-      remna:
-        ipv4_address: 192.168.243.3
+    container_name: remnanode
+    hostname: remnanode
+    image: remnawave/node:latest
+    restart: always
+    network_mode: host
+    # The torrent-blocker plugin only activates when nftables is available.
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - NODE_PORT=2222
+      - SECRET_KEY=supersecretkey
 
-networks:
-  remna:
-    external: true
+  caddy:
+    container_name: caddy
+    hostname: caddy
+    image: medium1992/caddy-tblocker:latest
+    restart: always
+    network_mode: host
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  caddy-data:
+  caddy-config:
