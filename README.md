@@ -1,6 +1,6 @@
 # caddy-tblocker
 
-> Custom [Caddy](https://caddyserver.com/) image with a native, in-memory TTL blocklist for the [Remna](https://github.com/remnawave) torrent-blocker webhook. It blocks a reported client IP at the HTTP edge before the request reaches Xray.
+> Custom [Caddy](https://caddyserver.com/) image with a native, in-memory TTL blocklist for the [Remnawave](https://github.com/remnawave) torrent-blocker webhook. Behind a CDN the node's own nftables ban is useless, because every packet the node sees comes from Caddy; this module moves the ban to the one place that still knows the real client address — and can tear the live tunnel down with it.
 
 [English](README.md) | [Русский](README_RU.md) | [Telegram](https://t.me/+96HVPF3Ww6o3YTNi)
 
@@ -13,39 +13,23 @@
 ## ✨ Features
 
 - 🧱 **Native Caddy module**: no database, Redis, sidecar, or external API on the request path.
-- ⏱️ **Temporary IP bans**: accepts Remna's `willUnblockAt` or `blockDuration`; an expired ban is removed when that IP next tries to connect.
-- 🌐 **One IP through the whole chain**: Caddy resolves the CDN real IP, passes it to Xray, and checks that same address against reports received from Remna.
-- 🔒 **Internal webhook listener**: restrict the sender by Docker subnet and keep port `9080` unpublished.
-- ⚡ **Early rejection**: bans are evaluated before the Xray reverse proxy.
-- 🐳 **Ready-made images**: multi-architecture `amd64` and `arm64` images for Docker Hub and GHCR.
-- 🔄 **Upstream tracking**: scheduled workflow rebuilds when Caddy or the Go toolchain changes.
+- ⏱️ **Temporary IP bans**: driven by the report's `blockDuration`, capped by `max_ttl`, swept in the background.
+- ✂️ **Tears down live tunnels**: with `drop_existing`, a ban cancels the requests already in flight instead of waiting for the client to reconnect.
+- 🌐 **One address end to end**: Caddy's resolved `{client_ip}` is what it forwards to Xray and what it later compares against.
+- 🔒 **Internal listener**: the webhook and admin routes are bound to loopback and restricted by source CIDR.
+- ⚡ **Checked first**: the directive is ordered ahead of every terminal handler, so no `route` wrapper is needed.
+- 🛟 **Safety net**: an `ignore` list that can never be banned, plus a bounded store.
+- 🔓 **Manual release**: list and lift bans over an internal admin route.
+- 🐳 **Ready-made images**: `amd64` and `arm64` for Docker Hub and GHCR.
 
 > [!IMPORTANT]
-> Bans live only in Caddy memory. A Caddy restart or reload clears them intentionally. This keeps a bad webhook or configuration from producing a persistent lockout.
+> Bans live only in Caddy's memory. A restart or a config reload clears them, on purpose: a bad webhook or a wrong configuration can never produce a lockout that outlives the process.
 
 ## 🚀 Quick Start
 
 ```bash
 docker pull medium1992/caddy-tblocker:latest
 ```
-
-Use the image instead of stock `caddy` in Compose:
-
-```yaml
-services:
-  caddy:
-    image: medium1992/caddy-tblocker:latest
-    restart: unless-stopped
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    # Do not publish 9080. Remna reaches it only inside this network.
-    ports:
-      - "443:443"
-```
-
-Images:
 
 ```text
 medium1992/caddy-tblocker:latest
@@ -54,91 +38,216 @@ ghcr.io/medium1992/caddy-tblocker:latest
 ghcr.io/medium1992/caddy-tblocker:vX.Y.Z
 ```
 
+It is a drop-in replacement for the stock `caddy` image — same config paths, same volumes, plus four extra modules.
+
 ## ⚙️ How It Works
 
-1. CDN sends the request to Caddy and supplies the real client address in `X-Real-IP`.
-2. Caddy resolves its `{client_ip}` from that header, then forwards the same address to Xray in `X-Forwarded-For`.
-3. Xray reports that forwarded address to the Remna node when the torrent-blocker rule is triggered.
-4. The node POSTs the IP and expiry to Caddy's internal `tblocker_webhook` endpoint.
-5. `tblocker` compares Caddy's resolved `{client_ip}` with the stored IP. Later matching requests receive `403` before they reach Xray.
+1. The CDN forwards the request to Caddy and puts the real client address in a header such as `X-Real-IP`.
+2. Caddy resolves `{client_ip}` from that header — but only because the TCP peer matches `trusted_proxies`.
+3. Caddy forwards that same `{client_ip}` to Xray as `X-Forwarded-For`, together with the marker header Xray is configured to trust.
+4. Xray uses that address as the connection source. When the bittorrent routing rule fires, the node reports it.
+5. The node POSTs the report to Caddy's internal `tblocker_webhook` route.
+6. `tblocker` stores the address, drops whatever that client has running, and answers `403` to everything it sends next.
 
-The current Remna payload is accepted as-is:
+The report the node sends is accepted as-is:
 
 ```json
 {
   "actionReport": {
+    "blocked": true,
     "ip": "203.0.113.42",
-    "blockDuration": 60,
-    "willUnblockAt": "2026-08-28T12:01:00.000Z"
-  }
+    "blockDuration": 3600,
+    "willUnblockAt": "2026-08-28T13:00:00.000Z",
+    "userId": "user@example.test"
+  },
+  "xrayReport": { "source": "203.0.113.42:0", "email": "user@example.test" }
 }
 ```
 
-`willUnblockAt` has priority. If it is absent, `blockDuration` is interpreted as seconds. `default_ttl` is used only when neither field is available; `max_ttl` caps any supplied expiration.
+`blockDuration` (seconds) takes priority. `willUnblockAt` is only a fallback, because it carries the node's wall clock: if the two containers disagree, a relative duration still produces the right ban while an absolute timestamp would shift it or expire it on arrival. `default_ttl` applies when neither field is usable, and `max_ttl` caps whatever is accepted.
 
-> [!NOTE]
-> Current Remna nodes emit torrent reports only when their nftables service is available. Keep the node's required nft capability: Caddy becomes the client-facing ban layer after the webhook is emitted.
+### What a ban actually stops
+
+Every ban refuses the client's **next** request immediately. What happens to the session already running depends on `drop_existing`:
+
+**Without `drop_existing`** the established tunnel is left alone, and how soon the ban bites depends entirely on the transport:
+
+| Xray transport | When the ban bites |
+|---|---|
+| XHTTP `packet-up` | **Immediately.** Every uplink chunk is its own POST, and each one is refused. |
+| XHTTP `stream-up` / `stream-one` | On reconnect. The session is a single long-lived request that already passed the check. |
+| WebSocket, HTTPUpgrade | On reconnect, for the same reason. |
+| gRPC | On reconnect. |
+
+**With `drop_existing`** the ban also cancels every request that client currently has open, on all of those transports. Caddy closes the upstream connection when a request context is done — including for hijacked WebSocket and HTTPUpgrade streams — so the tunnel dies at once instead of running until the client feels like reconnecting.
+
+Cancellation is per request, not per TCP connection. That distinction matters behind a CDN, where a single HTTP/2 connection to the origin can carry several unrelated subscribers: closing the socket would take all of them down, cancelling the request takes down only the offender's streams.
+
+> [!WARNING]
+> The whole scheme depends on Xray reading `X-Forwarded-For`, and Xray only does that for HTTP-based transports (`websocket`, `httpupgrade`, `splithttp`/XHTTP, and `grpc`). With a raw TCP + TLS inbound there is no header to read, Xray reports the address of whoever opened the TCP connection — Caddy — and the report is worthless.
+
+## 🐳 Deployment
+
+### Host networking — recommended
+
+Remnawave's own documentation runs the node with [`network_mode: host`](https://docs.rw/install/remnawave-node/), which it needs for its nftables plugins. Put Caddy in the same network namespace and the whole thing collapses to loopback: no user-defined network, no static addresses, and the internal listener is unreachable from outside the machine by construction.
+
+```yaml
+services:
+  remnanode:
+    container_name: remnanode
+    hostname: remnanode
+    image: remnawave/node:latest
+    restart: always
+    network_mode: host
+    # The torrent-blocker plugin only activates when nftables is available.
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - NODE_PORT=2222
+      - SECRET_KEY=supersecretkey
+
+  caddy:
+    container_name: caddy
+    hostname: caddy
+    image: medium1992/caddy-tblocker:latest
+    restart: always
+    network_mode: host
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  caddy-data:
+  caddy-config:
+```
+
+With host networking there are no `ports:` to publish and nothing to forget: Caddy binds `:443` on the host, the internal listener binds `127.0.0.1:9080` (see the `bind` directive in the Caddyfile below), and the node reaches it at `http://127.0.0.1:9080/…`.
+
+### Shared bridge network
+
+If you already run the node inside a user-defined network, the same setup works with container addresses instead of loopback. Substitute throughout: bind the internal listener to Caddy's address on that network, set `allow` to the network's CIDR, and point `webhookUrl` at Caddy's container address.
+
+```yaml
+services:
+  caddy:
+    image: medium1992/caddy-tblocker:latest
+    restart: unless-stopped
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    ports:
+      - "443:443"
+    # Never publish 9080: the node reaches it over this network only.
+    networks:
+      remnawave-network:
+        ipv4_address: 192.168.243.2
+
+  remnanode:
+    image: remnawave/node:latest
+    cap_add:
+      - NET_ADMIN
+    networks:
+      remnawave-network:
+        ipv4_address: 192.168.243.3
+
+networks:
+  remnawave-network:
+    external: true
+
+volumes:
+  caddy-data:
+  caddy-config:
+```
+
+> [!CAUTION]
+> On a bridge network the internal listener is reachable by every other container attached to it, and `allow` is your only guard. On host networking it is bound to loopback and reachable only from the machine itself. Prefer host networking unless you have a reason not to.
 
 ## 🧩 Caddyfile
 
-`route` is intentional: it preserves the declared directive order, ensuring the ban check always runs before terminal handlers such as `reverse_proxy`.
+Written for host networking; for a bridge network replace the loopback addresses as described above.
 
 ```caddy
 {
-  tblocker {
-    default_ttl 1m
-    max_ttl 24h
-  }
+	tblocker {
+		default_ttl 1m
+		max_ttl 24h
 
-  # Trust only real CDN ingress ranges here.
-  servers :443 {
-    trusted_proxies static 198.51.100.0/24 2001:db8:1234::/48
-    client_ip_headers X-Real-IP
-  }
+		# Never ban infrastructure. On host networking Xray's fallback address
+		# is loopback, so protecting it keeps a malformed report from taking
+		# the origin down.
+		ignore 127.0.0.0/8
+	}
+
+	# Trust only the CDN's documented ingress ranges.
+	servers :443 {
+		trusted_proxies static 198.51.100.0/24 2001:db8:1234::/48
+		client_ip_headers X-Real-IP
+	}
 }
 
-# Docker-network only. Do not publish port 9080 to the Internet.
-http://:9080 {
-  @remna_webhook path /internal/tblocker/replace-with-a-long-random-secret
-  handle @remna_webhook {
-    tblocker_webhook {
-      allow 192.168.243.0/28
-      max_body 64KB
-    }
-  }
+# `bind` is what actually restricts the socket to loopback. A site address of
+# `http://127.0.0.1:9080` alone only adds a Host matcher: Caddy would still
+# listen on every interface.
+http://127.0.0.1:9080 {
+	bind 127.0.0.1
 
-  respond 404
+	@node_webhook path /internal/tblocker/replace-with-a-long-random-secret
+	handle @node_webhook {
+		tblocker_webhook {
+			allow 127.0.0.0/8
+			max_body 64KiB
+		}
+	}
+
+	@tblocker_admin path /internal/tblocker/admin
+	handle @tblocker_admin {
+		tblocker_admin {
+			allow 127.0.0.0/8
+		}
+	}
+
+	respond 404
+
+	# The secret path would otherwise be written to the access log verbatim.
+	log {
+		output discard
+	}
 }
 
 example.com {
-  route {
-    # Must be first: checks the trusted client IP before Xray.
-    tblocker {
-      status 403
-    }
+	# No `route` wrapper: the directive is already ordered ahead of every
+	# handler that can end the chain, including `handle` and `respond`.
+	tblocker {
+		status 403
+		drop_existing
+	}
 
-    reverse_proxy 192.168.243.3:10000 {
-      # Pass the CDN-provided client address to Xray.
-      header_up X-Trusted-Proxy "caddy"
-      header_up X-Forwarded-For {http.request.header.X-Real-Ip}
-    }
-  }
+	reverse_proxy 127.0.0.1:10000 {
+		# The marker that lets Xray trust the forwarded address.
+		header_up X-Trusted-Proxy "caddy"
+		# Send exactly the address tblocker will check later.
+		header_up X-Forwarded-For {client_ip}
+	}
 }
 ```
 
-## 🔌 Remna Node and Xray
+> [!TIP]
+> Earlier versions of this README wrapped the site in `route { ... }`. That is no longer necessary — `tblocker` is registered to run before `redir`, which puts it ahead of `handle`, `handle_path`, `route`, `respond`, `error`, `abort` and `reverse_proxy`. An existing `route` block keeps working unchanged.
 
-The additional `webhookUrl` field in the Remna torrent-blocker plugin is available starting with **node v3.1.0**. Use the current node release when possible.
+## 🔌 Node Plugin and Xray
 
-This is the complete `torrentBlocker` block for the **node plugin configuration**. It belongs in Remna's node plugins, not in the Caddyfile and not in a client profile:
+`webhookUrl` in the torrent-blocker plugin is available from **node v3.1.0**. This is the complete `torrentBlocker` block for the **node plugin configuration** — it belongs in the node's plugins, not in the Caddyfile and not in a client profile:
 
 ```json
 {
   "torrentBlocker": {
     "enabled": true,
-    "webhookUrl": "http://192.168.243.2:9080/internal/tblocker/replace-with-a-long-random-secret",
+    "webhookUrl": "http://127.0.0.1:9080/internal/tblocker/replace-with-a-long-random-secret",
     "ignoreLists": {
-      "ip": [],
+      "ip": ["127.0.0.1"],
       "userId": []
     },
     "blockDuration": 3600
@@ -149,14 +258,17 @@ This is the complete `torrentBlocker` block for the **node plugin configuration*
 | Field | What to set |
 |---|---|
 | `enabled` | `true` enables torrent detection and the node's Xray routing rule. |
-| `webhookUrl` | The internal Caddy URL. Use Caddy's static Docker IP when service-name DNS is unavailable. The random path must exactly match the `@remna_webhook path` in the Caddyfile. |
-| `blockDuration` | Block duration in **seconds**. `3600` is one hour. Use a positive value with `caddy-tblocker`; `0` means permanent blocking to the node's nftables service, but cannot create a permanent in-memory Caddy ban. |
-| `ignoreLists.ip` | IP addresses or external lists (`ext:list_name`) that must never be blocked. Leave empty for none. |
-| `ignoreLists.userId` | Remna user IDs that must never be blocked. Leave empty for none. |
+| `webhookUrl` | Caddy's internal URL. On host networking that is `127.0.0.1:9080`; on a bridge network, Caddy's container address. The random path must match the Caddyfile matcher exactly. |
+| `blockDuration` | Block duration in **seconds**; `3600` is one hour. Use a positive value. `0` means a permanent nftables ban on the node, which an in-memory store cannot express, so Caddy falls back to `default_ttl`. |
+| `ignoreLists.ip` | Addresses that must never be blocked. **Put Caddy's own address here** — `127.0.0.1` on host networking. Entries are matched as exact strings, so a CIDR will never match; list the address itself. |
+| `ignoreLists.userId` | Xray user identifiers (the `email` field of the inbound user) that must never be blocked. |
 
-When the rule triggers, the node still applies its own nftables block and also sends the JSON report to `webhookUrl`. Caddy stores that report and blocks later HTTP requests from the same real IP.
+> [!NOTE]
+> The plugin only activates when the node's nftables service is available, so the node container needs `CAP_NET_ADMIN`. Without it no report is produced at all and Caddy never hears about anything.
 
-In the Xray **inbound** that accepts traffic from Caddy, configure the marker Caddy sends above:
+Note that it is the **node** that calls the webhook, directly, the moment its Xray fires the rule. The panel is not involved: it neither sends this report nor learns about the ban Caddy stored.
+
+In the Xray **inbound** that accepts traffic from Caddy, declare the marker header:
 
 ```json
 {
@@ -168,20 +280,40 @@ In the Xray **inbound** that accepts traffic from Caddy, configure the marker Ca
 }
 ```
 
-Xray accepts `X-Forwarded-For` only when one of the header names in `trustedXForwardedFor` is present. In this example, Caddy sends `X-Trusted-Proxy: caddy`, so `X-Trusted-Proxy` must appear in that list. The marker name is arbitrary, but the Caddy and Xray values must match.
-
-`header_up X-Forwarded-For ...` and `trustedXForwardedFor` are separate from the Remna plugin: they make the source IP reported by Xray equal to the CDN real IP that Caddy will later check.
+Xray accepts `X-Forwarded-For` only when one of the header names listed in `trustedXForwardedFor` is also present. Caddy sends `X-Trusted-Proxy: caddy`, so `X-Trusted-Proxy` has to appear in that list. The marker name is arbitrary, but the two sides must agree. This is separate from the plugin configuration: it is what makes the source address Xray reports equal to the real client address that Caddy will later check.
 
 ## 🔐 Real Client IP
 
-`{client_ip}` is Caddy's own resolved client address. It is not a header and it is not the TCP peer address of Xray. Caddy derives it from the CDN header only after the TCP peer matches `trusted_proxies`; `tblocker` compares this value with the IP stored by the webhook.
+`{client_ip}` is Caddy's own resolved client address. It is not a header, and it is not the TCP peer address Xray sees. Caddy takes it from the CDN header **only after** the TCP peer matches `trusted_proxies`; otherwise it is the peer address itself.
 
 - Replace the example CIDRs with the CDN's documented ingress ranges.
-- Firewall the origin so only that CDN can reach the public listener.
-- Never configure a public listener with `trusted_proxies static 0.0.0.0/0`; a direct caller could forge the header.
-- A separate CDN-only port protected by firewall may have its own trusted-proxy policy.
+- Firewall the origin so only the CDN can reach the public listener.
+- Never use `trusted_proxies static 0.0.0.0/0` on a public listener: a direct caller could then forge the header.
 
-Without this, Caddy sees the CDN edge IP and a Remna report for the subscriber IP cannot match.
+> [!CAUTION]
+> Forward `{client_ip}`, not a raw header. `header_up X-Forwarded-For {http.request.header.X-Real-Ip}` looks equivalent but is not: it copies an unvalidated header with no trust check at all. Anyone who reaches the origin directly can then set `X-Real-IP` to any address they like and have it reported as the offender — getting a third party banned while staying invisible themselves. If the header is simply missing, Caddy sets an empty `X-Forwarded-For`, Xray falls back to the TCP peer, and the node ends up reporting **Caddy's own address**, which its nftables ingress filter will then block. `{client_ip}` cannot do either of those things.
+
+Without `trusted_proxies` configured at all, `{client_ip}` is the CDN edge address: every subscriber behind that edge shares one value, and a single report would block all of them.
+
+## 🔓 Releasing a Ban
+
+The panel's own "unblock" command goes to the node's nftables endpoint and never reaches Caddy, so a ban has to be lifted here. The `tblocker_admin` route does that, from the machine itself:
+
+```bash
+# List every live ban
+curl http://127.0.0.1:9080/internal/tblocker/admin
+# {"count":1,"bans":[{"ip":"203.0.113.42","expires_at":"2026-08-28T13:00:00Z"}]}
+
+# Release one address
+curl -X DELETE 'http://127.0.0.1:9080/internal/tblocker/admin?ip=203.0.113.42'
+# {"removed":1}
+
+# Clear the whole blocklist
+curl -X DELETE http://127.0.0.1:9080/internal/tblocker/admin
+# {"removed":3}
+```
+
+Releasing an address that has no live ban returns `404`; an unparsable address returns `400`. Restarting Caddy also clears everything.
 
 ## 🛠️ Directives
 
@@ -189,43 +321,82 @@ Without this, Caddy sees the CDN edge IP and a Remna report for the subscriber I
 
 ```caddy
 tblocker {
-  default_ttl <Go duration>
-  max_ttl <Go duration>
+	default_ttl    <duration>
+	max_ttl        <duration>
+	sweep_interval <duration>
+	max_entries    <int>
+	ipv4_prefix    <1-32>
+	ipv6_prefix    <1-128>
+	ignore         <CIDR> [<CIDR>...]
 }
 ```
 
 | Option | Default | Description |
 |---|---:|---|
-| `default_ttl` | `1m` | Fallback expiry when the webhook supplies neither valid expiry field. |
-| `max_ttl` | `24h` | Maximum accepted lifetime for a ban. |
+| `default_ttl` | `1m` | Ban lifetime when the report carries no usable duration. |
+| `max_ttl` | `24h` | Upper bound on any accepted ban. |
+| `sweep_interval` | `1m` | How often expired entries are purged in the background. A banned address usually stops connecting, so without this its entry would linger until the next reload. |
+| `max_entries` | `100000` | Store bound. Once full, expired entries are reclaimed first; if it is still full the report is logged and dropped. |
+| `ipv4_prefix` | `32` | Ban width for IPv4. `24` bans the whole `/24`. |
+| `ipv6_prefix` | `128` | Ban width for IPv6. `64` is the useful value if you serve IPv6 clients, since a single host rotates its address within its `/64`. |
+| `ignore` | none | CIDRs that are never banned and never blocked. |
 
 ### Request handler
 
 ```caddy
 tblocker {
-  status 403
+	status 403
+	drop_existing
 }
 ```
 
 | Option | Default | Description |
 |---|---:|---|
-| `status` | `403` | HTTP response for a blocked client. Must be a 4xx status. |
+| `status` | `403` | Response for a blocked client. Must be `400`–`599`; anything else is rejected when the config is loaded. |
+| `drop_existing` | off | Cancel the requests already in flight for an address when it gets banned. Without it an established tunnel keeps running until the client reconnects. Accepts a bare flag, or `on` / `off`. |
+
+A request whose `{client_ip}` is empty or unparsable is passed through rather than blocked.
 
 ### Webhook handler
 
 ```caddy
 tblocker_webhook {
-  allow <CIDR> [<CIDR>...]
-  max_body <bytes>
+	allow    <CIDR> [<CIDR>...]
+	max_body <size>
 }
 ```
 
 | Option | Default | Description |
 |---|---:|---|
-| `allow` | required | CIDRs permitted to call the webhook. |
-| `max_body` | `64KB` | Maximum accepted webhook request body. |
+| `allow` | required | CIDRs permitted to submit reports, matched against the real TCP peer — never against a forwarded header. |
+| `max_body` | `64KiB` | Maximum accepted request body. |
 
-Successful webhook requests return `204 No Content`. Malformed payloads return `400`; callers outside `allow` receive `403`.
+A stored report returns `204`. A report for an `ignore`d address also returns `204`, is logged, and stores nothing. Malformed payloads return `400`, and callers outside `allow` get `403`.
+
+### Admin handler
+
+```caddy
+tblocker_admin {
+	allow <CIDR> [<CIDR>...]
+}
+```
+
+| Method | Effect |
+|---|---|
+| `GET` | Returns `{"count":N,"bans":[{"ip":…,"expires_at":…}]}`. |
+| `DELETE ?ip=<addr>` | Releases one address. `200` if it was live, `404` if not. |
+| `DELETE` | Clears the blocklist and returns how many live entries were removed. |
+
+Protect this route the same way as the webhook: an unguessable path, a loopback bind, and an `allow` list.
+
+## 🔎 Verifying the Chain
+
+If bans never appear, find out which link is broken before changing anything:
+
+1. **Does the node see the real client address?** Its log line reads `[TORRENT-BLOCKER] IP: <addr>, user: …`. If `<addr>` is Caddy's address, then `trustedXForwardedFor` or `header_up` is wrong — fix that first, everything downstream depends on it.
+2. **Does the report arrive?** Caddy logs `torrent client temporarily blocked` with `client_ip`, `expires_at` and `dropped_requests`. Nothing there means the webhook URL, the secret path, or the `allow` list is wrong. The node ignores webhook errors silently, so it will not tell you.
+3. **Is `drop_existing` doing anything?** `dropped_requests` in that same line is how many live requests were torn down. A steady `0` while sessions are clearly open means the ban is landing on a different address than the one Caddy resolves — go back to step 1.
+4. **Does Caddy resolve the same address?** Compare the ban listed by `tblocker_admin` with `{client_ip}` in your access logs. If they differ, `trusted_proxies` / `client_ip_headers` do not match what the CDN actually sends.
 
 ## 🏗️ Local Build
 
@@ -234,18 +405,20 @@ docker build -t caddy-tblocker:local .
 docker run --rm caddy-tblocker:local caddy version
 ```
 
-The image retains standard Caddy modules and adds:
+The image keeps the standard Caddy modules and adds:
 
 ```text
+tblocker
 http.handlers.tblocker
 http.handlers.tblocker_webhook
+http.handlers.tblocker_admin
 ```
 
 ## 🔄 Automatic Builds
 
-The GitHub Actions workflow can be run manually and checks upstream once a day. A manual run always builds; the scheduled run publishes only when Caddy or the Go toolchain changes. Images are built natively for `amd64` and `arm64`, then published to Docker Hub and GHCR.
+The workflow runs on demand and checks upstream once a day. A manual run always builds; the scheduled run publishes only when the Caddy release or the Go toolchain changes. The Go binary is cross-compiled for `amd64` and `arm64`, and the images are published to Docker Hub and GHCR.
 
-For Docker Hub publishing, add `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` as repository secrets. Set GitHub Actions **Workflow permissions** to **Read and write** so scheduled builds can update the tracked upstream version file.
+For Docker Hub publishing add `DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` as repository secrets, and set GitHub Actions **Workflow permissions** to **Read and write** so scheduled builds can update the tracked upstream version file.
 
 ## ⭐ Support
 
