@@ -59,9 +59,13 @@ func init() {
 	httpcaddyfile.RegisterDirectiveOrder("tblocker_admin", httpcaddyfile.Before, "respond")
 }
 
-// BanEntry is one live blocklist record as reported by the admin handler.
+// BanEntry is one live blocklist record as reported by the admin handler. IP
+// is always the address to hand back to the release endpoint; Network is set
+// only when the ban was widened by a prefix option and therefore covers more
+// than a single host.
 type BanEntry struct {
 	IP        string    `json:"ip"`
+	Network   string    `json:"network,omitempty"`
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
@@ -154,6 +158,7 @@ func (a *App) Provision(ctx caddy.Context) error {
 	if a.IPv6Prefix < 1 || a.IPv6Prefix > 128 {
 		return fmt.Errorf("tblocker: ipv6_prefix must be between 1 and 128")
 	}
+	a.ignore = nil
 	for _, raw := range a.Ignore {
 		prefix, err := netip.ParsePrefix(raw)
 		if err != nil {
@@ -229,15 +234,19 @@ func (a *App) sweepLocked(now time.Time) int {
 // prefix so that both sides of a comparison are always masked identically.
 func (a *App) key(addr netip.Addr) netip.Addr {
 	addr = addr.Unmap().WithZone("")
-	bits := a.v4Bits
-	if addr.Is6() {
-		bits = a.v6Bits
-	}
-	prefix, err := addr.Prefix(bits)
+	prefix, err := addr.Prefix(a.bits(addr))
 	if err != nil {
 		return addr
 	}
 	return prefix.Addr()
+}
+
+// bits is the configured ban width for addr's family.
+func (a *App) bits(addr netip.Addr) int {
+	if addr.Is6() {
+		return a.v6Bits
+	}
+	return a.v4Bits
 }
 
 // Ignored reports whether addr is protected from ever being banned.
@@ -289,6 +298,27 @@ func (a *App) store(key netip.Addr, expiresAt time.Time) bool {
 	a.bans[key] = expiresAt
 	return true
 }
+
+// admit registers an in-flight request as cancellable and then reports whether
+// it may proceed. The order matters and is the whole point of this method:
+// checking first and registering second leaves a window where a ban lands in
+// between, finds nobody to cancel, and lets a live tunnel outlive it. Ban
+// stores the entry before cancelling, so registering first means either we are
+// already in the set it cancels, or its entry is already visible to our check.
+// The caller must defer release regardless of the verdict.
+func (a *App) admit(addr netip.Addr, cancel context.CancelFunc) (release func(), allowed bool) {
+	release = a.trackRequest(addr, cancel)
+	if admitTestHook != nil {
+		admitTestHook()
+	}
+	return release, !a.IsBanned(addr)
+}
+
+// admitTestHook runs between registering a request and checking the blocklist.
+// It is nil in production and exists only so a test can drive the one
+// interleaving that would otherwise depend on the scheduler: a ban landing
+// exactly in that gap.
+var admitTestHook func()
 
 // trackRequest registers an in-flight request and returns its deregistration
 // function, which the caller must defer.
@@ -397,9 +427,14 @@ func (a *App) Bans() []BanEntry {
 	a.mu.RLock()
 	entries := make([]BanEntry, 0, len(a.bans))
 	for addr, expiresAt := range a.bans {
-		if expiresAt.After(now) {
-			entries = append(entries, BanEntry{IP: addr.String(), ExpiresAt: expiresAt.UTC()})
+		if !expiresAt.After(now) {
+			continue
 		}
+		entry := BanEntry{IP: addr.String(), ExpiresAt: expiresAt.UTC()}
+		if bits := a.bits(addr); bits < addr.BitLen() {
+			entry.Network = netip.PrefixFrom(addr, bits).String()
+		}
+		entries = append(entries, entry)
 	}
 	a.mu.RUnlock()
 	sort.Slice(entries, func(i, j int) bool { return entries[i].IP < entries[j].IP })
@@ -461,8 +496,8 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	if len(h.Headers) > 0 {
 		canonical := make(map[string][]string, len(h.Headers))
 		for name, values := range h.Headers {
-			if name == "" {
-				return fmt.Errorf("tblocker: header name must not be empty")
+			if err := validateHeaderName(name); err != nil {
+				return fmt.Errorf("tblocker: %w", err)
 			}
 			canonical[http.CanonicalHeaderKey(name)] = values
 		}
@@ -486,15 +521,18 @@ func (h Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhtt
 	if err != nil {
 		return next.ServeHTTP(w, r)
 	}
-	if !h.app.IsBanned(addr) {
-		if !h.DropExisting {
+	if !h.DropExisting {
+		if !h.app.IsBanned(addr) {
 			return next.ServeHTTP(w, r)
 		}
+	} else {
 		ctx, cancel := context.WithCancel(r.Context())
 		defer cancel()
-		release := h.app.trackRequest(addr, cancel)
+		release, allowed := h.app.admit(addr, cancel)
 		defer release()
-		return next.ServeHTTP(w, r.WithContext(ctx))
+		if allowed {
+			return next.ServeHTTP(w, r.WithContext(ctx))
+		}
 	}
 	if h.app.logger != nil {
 		h.app.logger.Debug("request denied", zap.String("client_ip", addr.String()))
@@ -615,10 +653,19 @@ func (h Webhook) ServeHTTP(w http.ResponseWriter, r *http.Request, _ caddyhttp.H
 func (h Webhook) expiration(report remnaReport) time.Time {
 	now := h.app.clock()
 
+	// Clamp before multiplying: seconds are multiplied by 1e9 to become a
+	// time.Duration, which overflows int64 at roughly 9.2e9 seconds and would
+	// silently turn an absurd report into a ban that expired in the past.
+	maxSeconds := int64(time.Duration(h.app.MaxTTL) / time.Second)
+	if maxSeconds < 1 {
+		maxSeconds = 1
+	}
+
 	var expiresAt time.Time
 	switch {
 	case report.ActionReport.BlockDuration > 0:
-		expiresAt = now.Add(time.Duration(report.ActionReport.BlockDuration) * time.Second)
+		seconds := min(report.ActionReport.BlockDuration, maxSeconds)
+		expiresAt = now.Add(time.Duration(seconds) * time.Second)
 	case report.ActionReport.WillUnblockAt.After(now):
 		expiresAt = report.ActionReport.WillUnblockAt
 	default:
@@ -758,6 +805,24 @@ func sourcePermitted(remoteAddr string, allowed []netip.Prefix) bool {
 	return false
 }
 
+// validateHeaderName checks the name is a valid RFC 9110 field token, so the
+// block response can never carry a malformed field.
+func validateHeaderName(name string) error {
+	if name == "" {
+		return fmt.Errorf("header name must not be empty")
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0:
+		default:
+			return fmt.Errorf("invalid header name %q", name)
+		}
+	}
+	return nil
+}
+
 func validateStatus(status int) error {
 	if status < 400 || status > 599 {
 		return fmt.Errorf("status must be an HTTP error status (400-599), got %d", status)
@@ -852,14 +917,24 @@ func parseHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {
 			switch len(values) {
 			case 1:
 				name := strings.TrimPrefix(values[0], "-")
-				if name == values[0] || name == "" {
+				if name == values[0] {
 					return nil, h.Errf(`header takes "<name> <value>", or "-<name>" to remove one`)
+				}
+				if err := validateHeaderName(name); err != nil {
+					return nil, h.Err(err.Error())
 				}
 				if handler.Headers == nil {
 					handler.Headers = make(map[string][]string)
 				}
 				handler.Headers[http.CanonicalHeaderKey(name)] = []string{}
 			case 2:
+				if strings.HasPrefix(values[0], "-") {
+					return nil, h.Errf(`use "header -%s" with no value to remove a header`,
+						strings.TrimPrefix(values[0], "-"))
+				}
+				if err := validateHeaderName(values[0]); err != nil {
+					return nil, h.Err(err.Error())
+				}
 				if handler.Headers == nil {
 					handler.Headers = make(map[string][]string)
 				}

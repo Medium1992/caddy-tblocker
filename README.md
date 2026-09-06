@@ -397,7 +397,7 @@ tblocker_admin {
 
 | Method | Effect |
 |---|---|
-| `GET` | Returns `{"count":N,"bans":[{"ip":…,"expires_at":…}]}`. |
+| `GET` | Returns `{"count":N,"bans":[{"ip":…,"expires_at":…}]}`. An entry also carries `network` when a prefix option widened the ban beyond one host; `ip` is always the value to hand back to the release endpoint. |
 | `DELETE ?ip=<addr>` | Releases one address. `200` if it was live, `404` if not. |
 | `DELETE` | Clears the blocklist and returns how many live entries were removed. |
 
