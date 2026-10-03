@@ -47,22 +47,80 @@ jobs:
           test -n "$go_version"
           echo "go_version=$go_version" >> "$GITHUB_OUTPUT"
 
+      - name: Check whether the Caddy base image is published
+        id: base
+        env:
+          DOCKER_TAG: ${{ steps.upstream.outputs.docker_tag }}
+        run: |
+          set -euo pipefail
+          # The official image lands on Docker Hub some time after the GitHub
+          # release, so the exact tag often does not exist yet on release day.
+          # Tell "not published yet" apart from "Docker Hub is unreachable":
+          # only the first is a reason to hold a build back.
+          status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 30 \
+            "https://hub.docker.com/v2/repositories/library/caddy/tags/${DOCKER_TAG}/" || echo 000)
+          case "$status" in
+            200) state=published ;;
+            404) state=pending ;;
+            *) state=unknown ;;
+          esac
+          echo "caddy:${DOCKER_TAG} is ${state} (HTTP ${status})"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+
       - name: Decide whether a scheduled build is needed
         id: decision
         env:
           LATEST: ${{ steps.upstream.outputs.caddy_version }}
           GO_VERSION: ${{ steps.toolchain.outputs.go_version }}
+          DOCKER_TAG: ${{ steps.upstream.outputs.docker_tag }}
+          BASE_STATE: ${{ steps.base.outputs.state }}
         run: |
           set -euo pipefail
           current_caddy=$(sed -n 's/^caddy=//p' VERSIONS)
           current_go=$(sed -n 's/^go=//p' VERSIONS)
+
+          manual=false
           if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
-            echo "build=true" >> "$GITHUB_OUTPUT"
-          elif [ "$LATEST" != "$current_caddy" ] || [ "$GO_VERSION" != "$current_go" ]; then
-            echo "build=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "build=false" >> "$GITHUB_OUTPUT"
+            manual=true
           fi
+
+          build=false
+          if [ "$manual" = true ] || [ "$LATEST" != "$current_caddy" ] || [ "$GO_VERSION" != "$current_go" ]; then
+            build=true
+          fi
+
+          # The base image only supplies the entrypoint, the default config and
+          # the CA bundle: the caddy binary it ships is replaced by the one this
+          # repository builds. Falling back to the floating tag therefore costs
+          # nothing, and is better than failing the run.
+          base_tag="$DOCKER_TAG"
+          if [ "$build" = true ]; then
+            case "$BASE_STATE" in
+              unknown)
+                base_tag=2
+                echo "::notice::Could not confirm caddy:${DOCKER_TAG} on Docker Hub; building on caddy:2."
+                ;;
+              pending)
+                if [ "$manual" = true ]; then
+                  base_tag=2
+                  echo "::notice::caddy:${DOCKER_TAG} is not on Docker Hub yet; building on caddy:2 so the manual release is not held up."
+                else
+                  build=false
+                  echo "::notice::caddy:${DOCKER_TAG} is not on Docker Hub yet; skipping until it is published."
+                  {
+                    echo "### Skipped"
+                    echo
+                    echo "Caddy \`${LATEST}\` is released, but \`caddy:${DOCKER_TAG}\` is not on Docker Hub yet."
+                    echo "A later scheduled run picks it up once it appears; run this workflow manually to publish without waiting."
+                  } >> "$GITHUB_STEP_SUMMARY"
+                fi
+                ;;
+            esac
+          fi
+
+          echo "build=$build base_tag=$base_tag"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "base_tag=$base_tag" >> "$GITHUB_OUTPUT"
 
       - name: Update and test the Caddy dependency
         if: steps.decision.outputs.build == 'true'
@@ -117,7 +175,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
-            CADDY_DOCKER_TAG=${{ steps.upstream.outputs.docker_tag }}
+            CADDY_DOCKER_TAG=${{ steps.decision.outputs.base_tag }}
             GO_VERSION=${{ steps.toolchain.outputs.go_version }}
             CADDY_VERSION=${{ steps.upstream.outputs.caddy_version }}
             CUSTOM_VERSION=${{ steps.metadata.outputs.custom_version }}
